@@ -1,0 +1,49 @@
+{
+  "id": "live-lens",
+  "name": "Live Lens",
+  "description": "Records bounded timing spans for OpenClaw turns, tools, model calls, compaction, and external plugin spans.",
+  "version": "0.1.0",
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "enabled": {
+        "type": "boolean",
+        "description": "Record timing spans from OpenClaw hooks and the span ingest endpoint.",
+        "default": true
+      },
+      "databasePath": {
+        "type": "string",
+        "description": "Plugin-relative SQLite database path for timing spans.",
+        "default": "./data/openclaw-live-lens.sqlite"
+      },
+      "recordHooks": {
+        "type": "boolean",
+        "description": "Record spans from OpenClaw typed hooks.",
+        "default": true
+      },
+      "captureContent": {
+        "type": "boolean",
+        "description": "Store bounded prompt/message/tool content fields. Disabled by default.",
+        "default": false
+      },
+      "maxAttributeChars": {
+        "type": "number",
+        "description": "Maximum JSON characters retained per span attributes payload.",
+        "default": 6000,
+        "minimum": 500,
+        "maximum": 50000
+      },
+      "maxIngestBytes": {
+        "type": "number",
+        "description": "Maximum accepted HTTP ingest body size.",
+        "default": 262144,
+        "minimum": 4096,
+        "maximum": 1048576
+      }
+    },
+    "additionalProperties": false
+  }
+}
