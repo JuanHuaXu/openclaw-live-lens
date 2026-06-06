@@ -11,10 +11,13 @@ const DEFAULT_DATABASE_PATH = "./data/openclaw-live-lens.sqlite";
 const DEFAULT_MAX_ATTRIBUTE_CHARS = 6_000;
 const DEFAULT_MAX_INGEST_BYTES = 256 * 1024;
 const MAX_SPANS_PER_INGEST = 200;
+const MAX_PENDING_SPANS = 5_000;
 const MAX_SPAN_NAME_CHARS = 160;
 const MAX_ATTR_STRING_CHARS = 1_000;
 const SENSITIVE_KEY_RE =
-  /(content|prompt|message|body|text|token|secret|password|credential|cookie|authorization|apikey|api_key|email|phone|address|sessionkey)/i;
+  /(content|prompt|message|body|text|query|url|uri|path|file|token|secret|password|credential|cookie|authorization|apikey|api_key|email|phone|address|sessionkey)/i;
+const METRIC_KEY_RE =
+  /(count|chars|bytes|ms|duration|elapsed|size|length|tokens?|tokenbudget|resultcount|cachehit|status|success|haserror|kind|phase|provider|model|api|transport|outcome|failurekind|toolname|toolkind|toolinputkind|paramkeys|derivedpathcount|hash)$/i;
 
 type LensConfig = {
   enabled: boolean;
@@ -79,7 +82,7 @@ function normalizeConfig(value: unknown): LensConfig {
   };
 }
 
-function createStore(dbPath: string): LensStore {
+function createStore(dbPath: string, onError: (error: unknown) => void): LensStore {
   mkdirSync(path.dirname(dbPath), { recursive: true });
   const db = new DatabaseSync(dbPath);
   db.exec(`
@@ -125,29 +128,73 @@ function createStore(dbPath: string): LensStore {
     ORDER BY created_at_ms DESC, id DESC
     LIMIT ?
   `);
+  const pending: SpanRecord[] = [];
+  let drainHandle: NodeJS.Immediate | undefined;
+  let closed = false;
+
+  const flushPending = () => {
+    if (pending.length === 0) {
+      return;
+    }
+    const batch = pending.splice(0, pending.length);
+    try {
+      db.exec("BEGIN");
+      for (const span of batch) {
+        insertStmt.run(
+          span.spanId,
+          span.parentSpanId ?? null,
+          span.source,
+          span.name,
+          span.phase ?? null,
+          span.runId ?? null,
+          span.callId ?? null,
+          span.toolCallId ?? null,
+          span.sessionHash ?? null,
+          span.agentId ?? null,
+          span.channelId ?? null,
+          Math.round(span.startedAtMs),
+          span.endedAtMs === undefined ? null : Math.round(span.endedAtMs),
+          span.durationMs ?? null,
+          JSON.stringify(span.attributes),
+          Date.now(),
+        );
+      }
+      db.exec("COMMIT");
+    } catch (error) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        // Ignore rollback failures; the original write error is the useful signal.
+      }
+      onError(error);
+    }
+  };
+
+  const scheduleDrain = () => {
+    if (drainHandle || closed) {
+      return;
+    }
+    drainHandle = setImmediate(() => {
+      drainHandle = undefined;
+      if (!closed) {
+        flushPending();
+      }
+    });
+  };
 
   return {
     insert(span) {
-      insertStmt.run(
-        span.spanId,
-        span.parentSpanId ?? null,
-        span.source,
-        span.name,
-        span.phase ?? null,
-        span.runId ?? null,
-        span.callId ?? null,
-        span.toolCallId ?? null,
-        span.sessionHash ?? null,
-        span.agentId ?? null,
-        span.channelId ?? null,
-        Math.round(span.startedAtMs),
-        span.endedAtMs === undefined ? null : Math.round(span.endedAtMs),
-        span.durationMs ?? null,
-        JSON.stringify(span.attributes),
-        Date.now(),
-      );
+      if (closed) {
+        return;
+      }
+      pending.push(span);
+      if (pending.length > MAX_PENDING_SPANS) {
+        pending.splice(0, pending.length - MAX_PENDING_SPANS);
+      }
+      scheduleDrain();
     },
     list(params) {
+      flushPending();
       const rows = listStmt.all(
         params.runId ?? null,
         params.runId ?? null,
@@ -178,6 +225,12 @@ function createStore(dbPath: string): LensStore {
       });
     },
     close() {
+      if (drainHandle) {
+        clearImmediate(drainHandle);
+        drainHandle = undefined;
+      }
+      flushPending();
+      closed = true;
       db.close();
     },
   };
@@ -503,9 +556,24 @@ function registerHttpRoutes(api: OpenClawPluginApi, store: LensStore, config: Le
         sendJson(res, 202, { ok: true, accepted: 0, disabled: true });
         return true;
       }
-      const body = await readRequestBody(req, config.maxIngestBytes);
-      const payload = safeJsonParse(body);
-      const spans = normalizeIngestedSpans(payload);
+      const bodyResult = await readRequestBodyResult(req, config.maxIngestBytes);
+      if (!bodyResult.ok) {
+        sendJson(res, bodyResult.tooLarge ? 413 : 400, {
+          ok: false,
+          error: bodyResult.tooLarge ? "body_too_large" : "body_read_failed",
+        });
+        return true;
+      }
+      const payload = parseJson(bodyResult.body);
+      if (!payload.ok) {
+        sendJson(res, 400, { ok: false, error: "invalid_json" });
+        return true;
+      }
+      const spans = normalizeIngestedSpans(payload.value);
+      if (spans.length === 0) {
+        sendJson(res, 400, { ok: false, error: "no_valid_spans" });
+        return true;
+      }
       let accepted = 0;
       for (const span of spans.slice(0, MAX_SPANS_PER_INGEST)) {
         recordSpan(store, config, {
@@ -562,13 +630,16 @@ function normalizeIngestedSpans(payload: unknown): SpanInput[] {
     agentId: record.agentId,
     channelId: record.channelId,
   };
-  return rawSpans.filter(isRecord).map((span) => ({
-    ...envelope,
-    ...span,
-    attributes: isRecord(span.attributes)
-      ? { ...envelope, ...span.attributes }
-      : envelope,
-  }));
+  return rawSpans
+    .filter(isRecord)
+    .filter((span) => normalizeOptionalString(span.name))
+    .map((span) => ({
+      ...envelope,
+      ...span,
+      attributes: isRecord(span.attributes)
+        ? { ...envelope, ...span.attributes }
+        : envelope,
+    }));
 }
 
 function sanitizeAttributes(value: unknown, config: LensConfig): Record<string, unknown> {
@@ -605,7 +676,10 @@ function sanitizeValue(value: unknown, config: LensConfig, depth: number): unkno
   }
   const out: Record<string, unknown> = {};
   for (const [key, raw] of Object.entries(value).slice(0, 100)) {
-    if (!config.captureContent && SENSITIVE_KEY_RE.test(key)) {
+    if (raw === undefined) {
+      continue;
+    }
+    if (shouldRedactAttribute(key, config)) {
       if (/sessionkey/i.test(key) && typeof raw === "string") {
         out[`${key}Hash`] = hashValue(raw);
       } else {
@@ -618,22 +692,48 @@ function sanitizeValue(value: unknown, config: LensConfig, depth: number): unkno
   return out;
 }
 
-function readRequestBody(req: IncomingMessage, maxBytes: number): Promise<string> {
-  return new Promise((resolve, reject) => {
+function shouldRedactAttribute(key: string, config: LensConfig): boolean {
+  if (config.captureContent) {
+    return false;
+  }
+  return SENSITIVE_KEY_RE.test(key) && !METRIC_KEY_RE.test(key);
+}
+
+function readRequestBodyResult(
+  req: IncomingMessage,
+  maxBytes: number,
+): Promise<{ ok: true; body: string } | { ok: false; tooLarge: boolean }> {
+  return new Promise((resolve) => {
     let total = 0;
+    let settled = false;
     const chunks: Buffer[] = [];
+    const settle = (value: { ok: true; body: string } | { ok: false; tooLarge: boolean }) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      resolve(value);
+    };
     req.on("data", (chunk: Buffer) => {
       total += chunk.byteLength;
       if (total > maxBytes) {
-        reject(new Error(`request body exceeds ${maxBytes} bytes`));
+        settle({ ok: false, tooLarge: true });
         req.destroy();
         return;
       }
       chunks.push(chunk);
     });
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
-    req.on("error", reject);
+    req.on("end", () => settle({ ok: true, body: Buffer.concat(chunks).toString("utf8") }));
+    req.on("error", () => settle({ ok: false, tooLarge: false }));
   });
+}
+
+function parseJson(value: string): { ok: true; value: unknown } | { ok: false } {
+  try {
+    return { ok: true, value: JSON.parse(value) };
+  } catch {
+    return { ok: false };
+  }
 }
 
 function sendJson(res: ServerResponse, statusCode: number, payload: unknown): void {
@@ -725,7 +825,9 @@ export default definePluginEntry({
   register(api) {
     const config = normalizeConfig(api.pluginConfig);
     const dbPath = path.resolve(api.rootDir ?? process.cwd(), config.databasePath);
-    const store = createStore(dbPath);
+    const store = createStore(dbPath, (error) => {
+      api.logger.error(`[live-lens] store write failed: ${String(error)}`);
+    });
 
     registerHookSpans(api, store, config);
     registerHttpRoutes(api, store, config);
@@ -736,6 +838,9 @@ export default definePluginEntry({
       cleanup: () => store.close(),
     });
 
-    api.logger.info(`[live-lens] recording ${config.enabled ? "enabled" : "disabled"} at ${dbPath}`);
+    const displayDbPath = api.rootDir ? path.relative(api.rootDir, dbPath) : path.basename(dbPath);
+    api.logger.info(
+      `[live-lens] recording ${config.enabled ? "enabled" : "disabled"} at ${displayDbPath}`,
+    );
   },
 });
