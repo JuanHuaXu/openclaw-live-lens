@@ -1,7 +1,7 @@
 {
   "name": "openclaw-live-lens",
   "version": "0.2.3",
-  "license": "MIT",
+  "license": "AGPL-3.0-only",
   "description": "Live timing lens for OpenClaw agent turns and plugin spans",
   "type": "module",
   "main": "dist/index.js",

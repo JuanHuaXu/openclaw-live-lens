@@ -6,6 +6,10 @@ Live Lens is an observability-only OpenClaw plugin for timing agent turns. It re
 
 Live Lens versions use `Major.Feature.Patch`.
 
+## License
+
+OpenClaw Live Lens is licensed under the GNU Affero General Public License v3.0. See [LICENSE](./LICENSE).
+
 ## What It Records
 
 - message received / sent hook observations
