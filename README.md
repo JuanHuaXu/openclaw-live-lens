@@ -135,18 +135,298 @@ session, but only when the nearest run is not ambiguous. If two candidate runs
 are too close together, the span remains session-scoped instead of being
 attributed to the wrong run.
 
+## Manual Hook Span Payloads
+
+You can generate a report manually by posting sanitized OpenClaw hook-shaped
+spans to the generic ingest endpoint. Use this when testing Live Lens without
+running a full live agent turn, or when replaying redacted timing evidence from
+logs.
+
+Post to the Gateway-authenticated endpoint:
+
+```sh
+curl -sS "$GATEWAY_ORIGIN/api/openclaw-lens/ingest/spans" \
+  -H "Content-Type: application/json" \
+  -H "$GATEWAY_AUTH_HEADER" \
+  --data-binary @manual-spans.json
+```
+
+For local-only dashboard debugging on the Gateway host, use the loopback route
+instead:
+
+```sh
+curl -sS "http://127.0.0.1:<gateway-port>/openclaw-lens/ingest/spans" \
+  -H "Content-Type: application/json" \
+  -H "X-OpenClaw-Live-Lens-Local-Ingest: 1" \
+  --data-binary @manual-spans.json
+```
+
+Use placeholders or pre-hashed values only. Do not include real prompt text,
+message text, tool output, session keys, channel IDs, user IDs, local paths,
+hostnames, IP addresses, tokens, or credentials in manual payloads.
+
+These are the OpenClaw hook span names Live Lens uses in reports:
+
+| OpenClaw hook | Span name | Phase | Timing shape |
+| --- | --- | --- | --- |
+| `message_received` | `openclaw.message_received` | `message` | point event; report can derive observed duration to the next span |
+| `before_prompt_build` | `openclaw.before_prompt_build` | `context` | point event; report can derive observed duration to the next span |
+| `before_agent_run` | `openclaw.before_agent_run` | `agent` | point event |
+| `model_call_started` | `openclaw.model_call` | `model` | point event with `attributes.status: "started"` |
+| `model_call_ended` | `openclaw.model_call` | `model` | duration span with `attributes.status: "ended"` |
+| `llm_input` | `openclaw.llm_input` | `model` | point event with input shape metadata |
+| `llm_output` | `openclaw.llm_output` | `model` | point event with output/usage metadata |
+| `before_tool_call` | `openclaw.before_tool_call` | `tool` | point event with tool metadata |
+| `after_tool_call` | `openclaw.tool_call` | `tool` | duration span with tool result metadata |
+| `before_compaction` | `openclaw.before_compaction` | `compaction` | point event |
+| `after_compaction` | `openclaw.after_compaction` | `compaction` | point event |
+| `message_sent` | `openclaw.message_sent` | `message` | point event |
+| `agent_end` | `openclaw.agent_run` | `agent` | duration span for the whole turn |
+
+Minimal one-shot turn payload:
+
+```json
+{
+  "runId": "manual-pong-run",
+  "sessionKeyHash": "example-session-hash",
+  "agentId": "main",
+  "channelId": "example-channel",
+  "spans": [
+    {
+      "source": "openclaw-hook",
+      "name": "openclaw.message_received",
+      "phase": "message",
+      "startedAtMs": 1770000000000,
+      "attributes": {
+        "provider": "example-channel-provider"
+      }
+    },
+    {
+      "source": "openclaw-hook",
+      "name": "openclaw.before_prompt_build",
+      "phase": "context",
+      "startedAtMs": 1770000000100,
+      "attributes": {
+        "messageCount": 3,
+        "promptChars": 42,
+        "contextTokenBudget": 262144
+      }
+    },
+    {
+      "source": "openclaw-hook",
+      "name": "openclaw.before_agent_run",
+      "phase": "agent",
+      "startedAtMs": 1770000000200,
+      "attributes": {
+        "messageCount": 3,
+        "systemPromptChars": 12000,
+        "promptChars": 42
+      }
+    },
+    {
+      "source": "openclaw-hook",
+      "name": "openclaw.llm_input",
+      "phase": "model",
+      "startedAtMs": 1770000000300,
+      "attributes": {
+        "provider": "example-model-provider",
+        "model": "example-model",
+        "historyCount": 3,
+        "toolCount": 20,
+        "promptChars": 42,
+        "systemPromptChars": 12000
+      }
+    },
+    {
+      "source": "openclaw-hook",
+      "name": "openclaw.model_call",
+      "phase": "model",
+      "callId": "manual-model-call-1",
+      "startedAtMs": 1770000000400,
+      "attributes": {
+        "status": "started",
+        "provider": "example-model-provider",
+        "model": "example-model",
+        "api": "example-api",
+        "transport": "http"
+      }
+    },
+    {
+      "source": "openclaw-hook",
+      "name": "openclaw.model_call",
+      "phase": "model",
+      "callId": "manual-model-call-1",
+      "startedAtMs": 1770000000400,
+      "endedAtMs": 1770000001200,
+      "durationMs": 800,
+      "attributes": {
+        "status": "ended",
+        "provider": "example-model-provider",
+        "model": "example-model",
+        "outcome": "success",
+        "requestPayloadBytes": 50000,
+        "responseStreamBytes": 500,
+        "timeToFirstByteMs": 500
+      }
+    },
+    {
+      "source": "openclaw-hook",
+      "name": "openclaw.llm_output",
+      "phase": "model",
+      "startedAtMs": 1770000001250,
+      "attributes": {
+        "provider": "example-model-provider",
+        "model": "example-model",
+        "outputTextCount": 1,
+        "usageInput": 12000,
+        "usageOutput": 4,
+        "usageTotal": 12004
+      }
+    },
+    {
+      "source": "openclaw-hook",
+      "name": "openclaw.message_sent",
+      "phase": "message",
+      "startedAtMs": 1770000001300,
+      "attributes": {
+        "success": true
+      }
+    },
+    {
+      "source": "openclaw-hook",
+      "name": "openclaw.agent_run",
+      "phase": "agent",
+      "startedAtMs": 1770000000000,
+      "endedAtMs": 1770000001400,
+      "durationMs": 1400,
+      "attributes": {
+        "success": true,
+        "messageCount": 4,
+        "hasError": false
+      }
+    }
+  ]
+}
+```
+
+Tool-continuation payload additions:
+
+```json
+{
+  "spans": [
+    {
+      "source": "openclaw-hook",
+      "name": "openclaw.before_tool_call",
+      "phase": "tool",
+      "toolCallId": "manual-tool-call-1",
+      "startedAtMs": 1770000001300,
+      "attributes": {
+        "toolName": "example_tool",
+        "toolKind": "plugin",
+        "toolInputKind": "json",
+        "paramKeys": ["query"],
+        "derivedPathCount": 0
+      }
+    },
+    {
+      "source": "openclaw-hook",
+      "name": "openclaw.tool_call",
+      "phase": "tool",
+      "toolCallId": "manual-tool-call-1",
+      "startedAtMs": 1770000001320,
+      "endedAtMs": 1770000001620,
+      "durationMs": 300,
+      "attributes": {
+        "toolName": "example_tool",
+        "toolKind": "plugin",
+        "toolInputKind": "json",
+        "hasError": false,
+        "resultKind": "object",
+        "paramKeys": ["query"]
+      }
+    },
+    {
+      "source": "openclaw-hook",
+      "name": "openclaw.model_call",
+      "phase": "model",
+      "callId": "manual-model-call-2",
+      "startedAtMs": 1770000001900,
+      "endedAtMs": 1770000002500,
+      "durationMs": 600,
+      "attributes": {
+        "status": "ended",
+        "provider": "example-model-provider",
+        "model": "example-model",
+        "outcome": "success"
+      }
+    }
+  ]
+}
+```
+
+Compaction payload additions:
+
+```json
+{
+  "spans": [
+    {
+      "source": "openclaw-hook",
+      "name": "openclaw.before_compaction",
+      "phase": "compaction",
+      "startedAtMs": 1770000002600,
+      "attributes": {
+        "messageCount": 25,
+        "compactingCount": 12,
+        "tokenCount": 24000
+      }
+    },
+    {
+      "source": "openclaw-hook",
+      "name": "openclaw.after_compaction",
+      "phase": "compaction",
+      "startedAtMs": 1770000002800,
+      "attributes": {
+        "messageCount": 14,
+        "compactedCount": 12,
+        "tokenCount": 9000
+      }
+    }
+  ]
+}
+```
+
+Optional provider HTTP spans can be posted alongside hook spans when you want
+the report to prefer measured provider/network timing over `openclaw.model_call`
+hook duration:
+
+```json
+{
+  "spans": [
+    {
+      "source": "model-proxy",
+      "name": "provider.http",
+      "phase": "model",
+      "startedAtMs": 1770000000400,
+      "durationMs": 800,
+      "attributes": {
+        "provider": "example-model-provider",
+        "model": "example-model",
+        "promptEvalCount": 12000,
+        "toolCount": 20,
+        "requestPayloadBytes": 50000,
+        "timeToFirstByteMs": 500
+      }
+    }
+  ]
+}
+```
+
 ## Dashboard
 
 Open the dashboard from the machine running the OpenClaw Gateway:
 
 ```text
 http://127.0.0.1:<gateway-port>/openclaw-lens/dashboard
-```
-
-For example, with a gateway on port `18789`:
-
-```text
-http://127.0.0.1:18789/openclaw-lens/dashboard
 ```
 
 The dashboard and its local JSON data endpoint are unauthenticated, but they
