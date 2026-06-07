@@ -2,9 +2,14 @@
   "id": "live-lens",
   "name": "Live Lens",
   "description": "Records bounded timing spans for OpenClaw turns, tools, model calls, compaction, and external plugin spans.",
-  "version": "0.1.0",
+  "version": "0.2.3",
   "activation": {
     "onStartup": true
+  },
+  "contracts": {
+    "tools": [
+      "live_lens_probe"
+    ]
   },
   "configSchema": {
     "type": "object",

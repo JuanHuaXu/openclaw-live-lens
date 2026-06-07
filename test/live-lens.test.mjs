@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
@@ -64,11 +64,12 @@ function createHarness(config = {}) {
 
 async function invoke(
   route,
-  { method = "GET", url = route.path, body = "", remoteAddress = "127.0.0.1" } = {},
+  { method = "GET", url = route.path, body = "", remoteAddress = "127.0.0.1", requestHeaders = {} } = {},
 ) {
   const req = Readable.from(body ? [Buffer.from(body)] : []);
   req.method = method;
   req.url = url;
+  req.headers = requestHeaders;
   req.socket = { remoteAddress };
   let responseBody = "";
   const headers = {};
@@ -188,6 +189,25 @@ test("live test probe tool is registered and hook telemetry keeps tool metadata"
   }
 });
 
+test("manifest declares registered live test tool contract", async () => {
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), "live-lens-"));
+  const harness = createHarness({ rootDir });
+  try {
+    const manifest = JSON.parse(
+      await readFile(new URL("../openclaw.plugin.json", import.meta.url), "utf8"),
+    );
+    const declaredTools = new Set(manifest.contracts?.tools ?? []);
+    const registeredTools = harness.tools.map((tool) => tool.name);
+    assert.equal(registeredTools.includes("live_lens_probe"), true);
+    for (const toolName of registeredTools) {
+      assert.equal(declaredTools.has(toolName), true, `${toolName} missing from contracts.tools`);
+    }
+  } finally {
+    await harness.cleanup();
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
 test("dashboard route serves async spans view", async () => {
   const rootDir = await mkdtemp(path.join(os.tmpdir(), "live-lens-"));
   const harness = createHarness({ rootDir });
@@ -198,7 +218,7 @@ test("dashboard route serves async spans view", async () => {
     assert.equal(result.statusCode, 200);
     assert.match(String(result.headers["content-type"]), /^text\/html/);
     assert.match(result.body, /<title>Live Lens 🔍<\/title>/);
-    assert.match(result.body, /rel="icon"/);
+    assert.match(result.body, /<link rel="icon" href="data:image\/svg\+xml,/);
     assert.match(result.body, /<h1>Live Lens 🔍<\/h1>/);
     assert.match(result.body, /fetch\("\/openclaw-lens\/spans\?/);
     assert.match(result.body, /class="control-panels"/);
@@ -209,7 +229,9 @@ test("dashboard route serves async spans view", async () => {
     assert.match(result.body, /id="liveTestTools" type="checkbox"/);
     assert.match(result.body, /> Tools<\/label>/);
     assert.match(result.body, /id="clearFilter"/);
+    assert.match(result.body, /id="reportLink"/);
     assert.match(result.body, />Clear Filter<\/button>/);
+    assert.match(result.body, />Open Report<\/a>/);
     assert.match(result.body, />Clear E2E<\/button>/);
     assert.match(result.body, /fetch\("\/openclaw-lens\/e2e-test"/);
     assert.match(result.body, /fetch\("\/openclaw-lens\/live-test"/);
@@ -217,9 +239,26 @@ test("dashboard route serves async spans view", async () => {
     assert.match(result.body, /setInterval\(\(\) =>/);
     assert.match(result.body, /id="autoRefresh"/);
     assert.match(result.body, /async function clearFilters\(\) \{/);
+    assert.match(result.body, /function updateReportLink\(\) \{/);
+    assert.match(result.body, /function displayDuration\(span\) \{/);
+    assert.match(result.body, /function formatDashboardDuration\(span\) \{/);
+    assert.match(result.body, /observedDurationMs/);
+    assert.match(result.body, /durationSource/);
+    assert.match(result.body, /derived-next-span/);
+    assert.match(result.body, /paired-ended/);
+    assert.match(result.body, /point/);
+    assert.match(result.body, /function filterParams\(\) \{/);
+    assert.match(result.body, /params\.set\("format", "html"\);/);
+    assert.match(result.body, /reportLink\.href = "\/openclaw-lens\/report\?" \+ reportParams\(\)\.toString\(\);/);
     assert.match(result.body, /if \(liveTestToolsInput\.checked\) params\.set\("tools", "1"\);/);
     assert.match(result.body, /fetch\("\/openclaw-lens\/live-test" \+ \(params\.size \? "\?" \+ params\.toString\(\) : ""\)/);
     assert.match(result.body, /clearFilterButton\.addEventListener\("click", clearFilters\)/);
+    assert.match(result.body, /\$\("runId"\)\.addEventListener\("input", updateReportLink\)/);
+    assert.match(result.body, /\$\("limit"\)\.addEventListener\("change", updateReportLink\)/);
+    assert.equal(
+      result.body.indexOf('id="reportLink"') > result.body.indexOf('aria-label="Test controls"'),
+      true,
+    );
     const clearDashboardBody =
       result.body.match(/async function clearDashboard\(\) \{([\s\S]*?)\n    \}/)?.[1] ?? "";
     const clearFiltersBody = result.body.match(/async function clearFilters\(\) \{([\s\S]*?)\n    \}/)?.[1] ?? "";
@@ -275,6 +314,27 @@ test("local e2e endpoint creates a full turn trace", async () => {
     assert.equal(toolSpan.attributes.hasError, false);
     const agentSpan = result.json.spans.find((span) => span.name === "openclaw.agent_run");
     assert.equal(agentSpan.attributes.success, true);
+
+    const htmlReport = await invoke(harness.route("/openclaw-lens/report"), {
+      url: `/openclaw-lens/report?runId=${created.json.runId}`,
+    });
+    assert.equal(htmlReport.statusCode, 200);
+    assert.match(String(htmlReport.headers["content-type"]), /^text\/html/);
+    assert.match(htmlReport.body, /<h1>Live Lens Report<\/h1>/);
+    assert.match(htmlReport.body, /<link rel="icon" href="data:image\/svg\+xml,/);
+    assert.match(htmlReport.body, /Hook Integration/);
+    assert.match(htmlReport.body, /openclaw\.message_received/);
+    assert.match(htmlReport.body, /View JSON/);
+
+    const jsonReport = await invoke(harness.route("/openclaw-lens/report"), {
+      url: `/openclaw-lens/report?runId=${created.json.runId}&format=json`,
+    });
+    assert.equal(jsonReport.statusCode, 200);
+    assert.equal(jsonReport.json.ok, true);
+    assert.equal(
+      jsonReport.json.hookRows.some((row) => row.name === "openclaw.message_received"),
+      true,
+    );
 
     const method = await invoke(harness.route("/openclaw-lens/e2e-test"), {
       method: "GET",
@@ -358,6 +418,19 @@ test("local dashboard routes reject non-loopback clients", async () => {
     assert.equal(spans.statusCode, 403);
     assert.equal(spans.json.error, "localhost_only");
 
+    const report = await invoke(harness.route("/openclaw-lens/report"), {
+      remoteAddress: "203.0.113.10",
+    });
+    assert.equal(report.statusCode, 403);
+    assert.equal(report.json.error, "localhost_only");
+
+    const ingest = await invoke(harness.route("/openclaw-lens/ingest/spans"), {
+      method: "POST",
+      remoteAddress: "203.0.113.10",
+    });
+    assert.equal(ingest.statusCode, 403);
+    assert.equal(ingest.json.error, "localhost_only");
+
     const e2eTest = await invoke(harness.route("/openclaw-lens/e2e-test"), {
       method: "POST",
       remoteAddress: "203.0.113.10",
@@ -378,6 +451,447 @@ test("local dashboard routes reject non-loopback clients", async () => {
     });
     assert.equal(clear.statusCode, 403);
     assert.equal(clear.json.error, "localhost_only");
+  } finally {
+    await harness.cleanup();
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("generic ingest and report derive PONG and tool timing tables", async () => {
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), "live-lens-"));
+  const harness = createHarness({ rootDir });
+  try {
+    const ingest = await invoke(harness.route("/api/openclaw-lens/ingest/spans"), {
+      method: "POST",
+      body: JSON.stringify({
+        spans: [
+          {
+            runId: "simple-run",
+            name: "openclaw.agent_run",
+            phase: "agent",
+            startedAtMs: 1_000,
+            durationMs: 2_724,
+            attributes: {
+              case: "Live config + LibraVDB",
+              success: true,
+            },
+          },
+          {
+            runId: "simple-run",
+            source: "ollama-proxy",
+            name: "ollama.http",
+            phase: "model",
+            startedAtMs: 1_320,
+            durationMs: 638,
+            attributes: {
+              case: "Live config + LibraVDB",
+              promptEvalCount: 20_205,
+              toolCount: 28,
+              url: "http://10.0.0.1:11434/api/chat",
+            },
+          },
+          {
+            runId: "simple-run",
+            source: "libravdb",
+            name: "libravdb.daemon.assembleContextInternal",
+            phase: "memory",
+            startedAtMs: 1_050,
+            durationMs: 532,
+            attributes: {
+              cacheHit: false,
+            },
+          },
+          {
+            runId: "tool-run",
+            name: "openclaw.agent_run",
+            phase: "agent",
+            startedAtMs: 10_000,
+            durationMs: 12_937,
+            attributes: {
+              runShape: "Core web_search",
+              success: true,
+            },
+          },
+          {
+            runId: "tool-run",
+            source: "ollama-proxy",
+            name: "ollama.http",
+            phase: "model",
+            startedAtMs: 11_702,
+            durationMs: 4_650,
+            attributes: {
+              runShape: "Core web_search",
+              promptEvalCount: 18_000,
+              toolCount: 28,
+            },
+          },
+          {
+            runId: "tool-run",
+            name: "openclaw.tool_call",
+            phase: "tool",
+            startedAtMs: 17_345,
+            durationMs: 993,
+            attributes: {
+              runShape: "Core web_search",
+              toolName: "web_search",
+              hasError: false,
+            },
+          },
+          {
+            runId: "tool-run",
+            source: "ollama-proxy",
+            name: "ollama.http",
+            phase: "model",
+            startedAtMs: 19_233,
+            durationMs: 4_325,
+            attributes: {
+              runShape: "Core web_search",
+            },
+          },
+          {
+            runId: "duration-only",
+            source: "external-probe",
+            name: "external.durationOnly",
+            phase: "model",
+            durationMs: 250,
+            attributes: {
+              case: "duration only",
+            },
+          },
+          {
+            sessionKey: "agent:main:discord:hook-only",
+            source: "openclaw-hook",
+            name: "openclaw.message_received",
+            phase: "message",
+            startedAtMs: 30_000,
+            attributes: {},
+          },
+          {
+            sessionKey: "agent:main:discord:hook-only",
+            source: "openclaw-hook",
+            name: "openclaw.message_sent",
+            phase: "message",
+            startedAtMs: 30_500,
+            attributes: {
+              success: true,
+            },
+          },
+        ],
+      }),
+    });
+    assert.equal(ingest.statusCode, 202);
+    assert.equal(ingest.json.accepted, 10);
+
+    const simpleReport = await invoke(harness.route("/api/openclaw-lens/report"), {
+      url: "/api/openclaw-lens/report?runId=simple-run",
+    });
+    assert.equal(simpleReport.statusCode, 200);
+    assert.equal(simpleReport.json.simpleRows.length, 1);
+    assert.deepEqual(simpleReport.json.simpleRows[0], {
+      case: "Live config + LibraVDB",
+      totalMs: 2724,
+      ollamaHttpMs: 638,
+      nonOllamaOverheadMs: 2086,
+      inputTokens: 20205,
+      tools: 28,
+      runId: "simple-run",
+    });
+    assert.equal(simpleReport.json.toolRows.length, 0);
+    assert.equal(
+      simpleReport.json.subcostRows.some((row) =>
+        row.name === "libravdb.daemon.assembleContextInternal" && row.latestMs === 532
+      ),
+      true,
+    );
+
+    const toolReport = await invoke(harness.route("/api/openclaw-lens/report"), {
+      url: "/api/openclaw-lens/report?runId=tool-run",
+    });
+    assert.equal(toolReport.statusCode, 200);
+    assert.deepEqual(toolReport.json.toolRows[0], {
+      runShape: "Core web_search",
+      totalMs: 12937,
+      preFirstOllamaMs: 1702,
+      firstOllamaMs: 4650,
+      toolMs: 993,
+      toolDoneToSecondOllamaMs: 895,
+      secondOllamaMs: 4325,
+      toolName: "web_search",
+      runId: "tool-run",
+    });
+    const stored = await invoke(harness.route("/api/openclaw-lens/spans"), {
+      url: "/api/openclaw-lens/spans?runId=simple-run",
+    });
+    const httpSpan = stored.json.spans.find((span) => span.name === "ollama.http");
+    assert.equal(httpSpan.attributes.url, "[redacted]");
+
+    const durationOnly = await invoke(harness.route("/api/openclaw-lens/spans"), {
+      url: "/api/openclaw-lens/spans?runId=duration-only",
+    });
+    const [durationOnlySpan] = durationOnly.json.spans;
+    assert.equal(durationOnlySpan.durationMs, 250);
+    assert.equal(durationOnlySpan.endedAtMs - durationOnlySpan.startedAtMs, 250);
+    assert.equal(durationOnlySpan.endedAtMs <= durationOnlySpan.createdAtMs, true);
+
+    const hookOnlyReport = await invoke(harness.route("/api/openclaw-lens/report"), {
+      url: "/api/openclaw-lens/report?sessionKey=agent%3Amain%3Adiscord%3Ahook-only",
+    });
+    assert.equal(hookOnlyReport.json.simpleRows[0].case, "OpenClaw hooks: openclaw.message_received + 1 more");
+    assert.equal(
+      hookOnlyReport.json.simpleRows.some((row) => row.case === "Unlabeled run"),
+      false,
+    );
+
+    const method = await invoke(harness.route("/api/openclaw-lens/report"), {
+      method: "POST",
+    });
+    assert.equal(method.statusCode, 405);
+    assert.equal(method.json.error, "method_not_allowed");
+
+    const apiHtmlReport = await invoke(harness.route("/api/openclaw-lens/report"), {
+      url: "/api/openclaw-lens/report?runId=simple-run&format=html",
+    });
+    assert.equal(apiHtmlReport.statusCode, 200);
+    assert.match(String(apiHtmlReport.headers["content-type"]), /^text\/html/);
+    assert.match(apiHtmlReport.body, /Live config \+ LibraVDB/);
+  } finally {
+    await harness.cleanup();
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("report guardrails avoid ambiguous hooks and non-model HTTP spans", async () => {
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), "live-lens-"));
+  const harness = createHarness({ rootDir });
+  try {
+    const sessionKey = "agent:main:dashboard:ambiguous";
+    const ingest = await invoke(harness.route("/api/openclaw-lens/ingest/spans"), {
+      method: "POST",
+      body: JSON.stringify({
+        spans: [
+          {
+            runId: "run-a",
+            sessionKey,
+            name: "openclaw.agent_run",
+            phase: "agent",
+            startedAtMs: 1_000,
+            durationMs: 1_000,
+            attributes: { case: "Run A" },
+          },
+          {
+            runId: "run-b",
+            sessionKey,
+            name: "openclaw.agent_run",
+            phase: "agent",
+            startedAtMs: 2_200,
+            durationMs: 1_000,
+            attributes: { case: "Run B" },
+          },
+          {
+            sessionKey,
+            source: "openclaw-hook",
+            name: "openclaw.message_received",
+            phase: "message",
+            startedAtMs: 2_100,
+            attributes: {},
+          },
+          {
+            runId: "http-guard",
+            name: "openclaw.agent_run",
+            phase: "agent",
+            startedAtMs: 10_000,
+            durationMs: 1_500,
+            attributes: { case: "HTTP guard" },
+          },
+          {
+            runId: "http-guard",
+            source: "web-proxy",
+            name: "proxy.http",
+            phase: "network",
+            startedAtMs: 10_100,
+            durationMs: 999,
+            attributes: { requestCount: 1 },
+          },
+          {
+            runId: "http-guard",
+            source: "openclaw-hook",
+            name: "openclaw.model_call",
+            phase: "model",
+            startedAtMs: 10_300,
+            durationMs: 333,
+            attributes: { status: "ended" },
+          },
+        ],
+      }),
+    });
+    assert.equal(ingest.statusCode, 202);
+    assert.equal(ingest.json.accepted, 6);
+
+    const runA = await invoke(harness.route("/api/openclaw-lens/spans"), {
+      url: "/api/openclaw-lens/spans?runId=run-a",
+    });
+    assert.equal(
+      runA.json.spans.some((span) => span.name === "openclaw.message_received"),
+      false,
+    );
+
+    const httpGuard = await invoke(harness.route("/api/openclaw-lens/report"), {
+      url: "/api/openclaw-lens/report?runId=http-guard",
+    });
+    assert.equal(httpGuard.statusCode, 200);
+    assert.equal(httpGuard.json.simpleRows[0].ollamaHttpMs, 333);
+    assert.equal(httpGuard.json.simpleRows[0].nonOllamaOverheadMs, 1167);
+  } finally {
+    await harness.cleanup();
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("loopback ingest requires explicit local ingest header", async () => {
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), "live-lens-"));
+  const harness = createHarness({ rootDir });
+  try {
+    const body = JSON.stringify({
+      spans: [
+        {
+          runId: "local-ingest",
+          name: "local.probe",
+          durationMs: 10,
+          attributes: { case: "local" },
+        },
+      ],
+    });
+    const missingHeader = await invoke(harness.route("/openclaw-lens/ingest/spans"), {
+      method: "POST",
+      body,
+    });
+    assert.equal(missingHeader.statusCode, 403);
+    assert.equal(missingHeader.json.error, "local_ingest_header_required");
+    assert.equal(missingHeader.json.header, "x-openclaw-live-lens-local-ingest");
+
+    const accepted = await invoke(harness.route("/openclaw-lens/ingest/spans"), {
+      method: "POST",
+      body,
+      requestHeaders: {
+        "x-openclaw-live-lens-local-ingest": "1",
+      },
+    });
+    assert.equal(accepted.statusCode, 202);
+    assert.equal(accepted.json.accepted, 1);
+  } finally {
+    await harness.cleanup();
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("report derives durations for runless pre-run hooks", async () => {
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), "live-lens-"));
+  const harness = createHarness({ rootDir });
+  try {
+    const sessionKey = "agent:main:dashboard:pong-derived";
+    const ingest = await invoke(harness.route("/api/openclaw-lens/ingest/spans"), {
+      method: "POST",
+      body: JSON.stringify({
+        spans: [
+          {
+            sessionKey,
+            source: "openclaw-hook",
+            name: "openclaw.message_received",
+            phase: "message",
+            startedAtMs: 1_000,
+            attributes: {},
+          },
+          {
+            runId: "pong-derived-run",
+            sessionKey,
+            source: "openclaw-hook",
+            name: "openclaw.before_prompt_build",
+            phase: "context",
+            startedAtMs: 1_300,
+            attributes: {},
+          },
+          {
+            runId: "pong-derived-run",
+            sessionKey,
+            source: "openclaw-hook",
+            name: "openclaw.model_call",
+            phase: "model",
+            startedAtMs: 1_501,
+            attributes: {
+              status: "started",
+            },
+          },
+          {
+            runId: "pong-derived-run",
+            sessionKey,
+            source: "openclaw-hook",
+            name: "openclaw.model_call",
+            phase: "model",
+            startedAtMs: 1_500,
+            durationMs: 700,
+            attributes: {
+              status: "ended",
+            },
+          },
+          {
+            runId: "point-run",
+            sessionKey,
+            source: "openclaw-hook",
+            name: "openclaw.llm_output",
+            phase: "model",
+            startedAtMs: 9_000,
+            attributes: {},
+          },
+        ],
+      }),
+    });
+    assert.equal(ingest.statusCode, 202);
+    assert.equal(ingest.json.accepted, 5);
+
+    const report = await invoke(harness.route("/api/openclaw-lens/report"), {
+      url: "/api/openclaw-lens/report?runId=pong-derived-run",
+    });
+    assert.equal(report.statusCode, 200);
+    assert.equal(report.json.simpleRows.length, 1);
+    assert.equal(report.json.simpleRows[0].totalMs, 1_200);
+    assert.equal(report.json.simpleRows[0].ollamaHttpMs, 700);
+    assert.equal(report.json.simpleRows[0].nonOllamaOverheadMs, 500);
+
+    const hooks = new Map(report.json.hookRows.map((row) => [row.name, row]));
+    assert.equal(hooks.get("openclaw.message_received").latestObservedMs, 300);
+    assert.equal(hooks.get("openclaw.message_received").observationSource, "derived-next-span");
+    assert.equal(hooks.get("openclaw.before_prompt_build").latestObservedMs, 200);
+    assert.equal(hooks.get("openclaw.before_prompt_build").observationSource, "derived-next-span");
+    assert.equal(hooks.get("openclaw.model_call").latestEmittedMs, 700);
+    assert.equal(hooks.get("openclaw.model_call").latestObservedMs, 700);
+    assert.equal(hooks.get("openclaw.model_call").observationSource, "emitted");
+
+    const spans = await invoke(harness.route("/api/openclaw-lens/spans"), {
+      url: "/api/openclaw-lens/spans?runId=pong-derived-run",
+    });
+    assert.equal(spans.statusCode, 200);
+    const messageSpan = spans.json.spans.find((span) => span.name === "openclaw.message_received");
+    const promptSpan = spans.json.spans.find((span) => span.name === "openclaw.before_prompt_build");
+    const startedModelSpan = spans.json.spans.find((span) =>
+      span.name === "openclaw.model_call" && span.attributes.status === "started"
+    );
+    const modelSpan = spans.json.spans.find((span) => span.name === "openclaw.model_call" && span.durationMs === 700);
+    assert.equal(messageSpan.observedDurationMs, 300);
+    assert.equal(messageSpan.durationSource, "derived-next-span");
+    assert.equal(promptSpan.observedDurationMs, 200);
+    assert.equal(promptSpan.durationSource, "derived-next-span");
+    assert.equal(startedModelSpan.observedDurationMs, 700);
+    assert.equal(startedModelSpan.durationSource, "paired-ended");
+    assert.equal(modelSpan.observedDurationMs, 700);
+    assert.equal(modelSpan.durationSource, "emitted");
+    assert.equal(spans.json.spans.every((span) => typeof span.observedDurationMs === "number"), true);
+
+    const pointSpans = await invoke(harness.route("/api/openclaw-lens/spans"), {
+      url: "/api/openclaw-lens/spans?runId=point-run",
+    });
+    const pointSpan = pointSpans.json.spans.find((span) => span.name === "openclaw.llm_output");
+    assert.equal(pointSpan.observedDurationMs, 0);
+    assert.equal(pointSpan.durationSource, "point");
   } finally {
     await harness.cleanup();
     await rm(rootDir, { recursive: true, force: true });
